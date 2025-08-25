@@ -24,37 +24,162 @@ class Reel_model extends CI_Model
 
     /* ================= صفحات =================
        الآن جميع عمليات الجلب للصفحات تعتمد على جدول المنصة facebook_rx_fb_page_info
-       ونستخدم الحقول الموجودة في بنية جدولكم (page_id, page_name, page_profile/page_cover, page_access_token, username)
+       ونحاول دمج أي بيانات قد توجد في facebook_pages أو أعمدة IG داخل facebook_rx_fb_page_info
+       (تضمن إرجاع الحقول: fb_page_id, page_name, page_picture, page_access_token, is_favorite,
+        ig_linked, ig_user_id, ig_username, ig_profile_picture, ig_health_status, scheduled_count, last_posted_at, rx_id)
     */
+    
+    
+    
+    
+    
     public function get_user_pages($user_id)
     {
         if (!$this->db->table_exists('facebook_rx_fb_page_info')) {
-            // إذا لم يكن جدول المنصة موجودًا نرجع مصفوفة فارغة لتفادي الأخطاء
             return [];
         }
 
-        $this->db->select("
-            page_id AS fb_page_id,
-            COALESCE(page_name, username, page_id) AS page_name,
-            COALESCE(page_profile, page_cover, '') AS page_picture,
-            COALESCE(page_access_token, '') AS page_access_token,
-            id AS rx_id
-        ", false);
-        $this->db->from('facebook_rx_fb_page_info');
-        $this->db->where('user_id', $user_id);
-        $this->db->order_by('COALESCE(page_name, username, page_id)', 'ASC', false);
-        $rows = $this->db->get()->result_array();
+        $facebook_pages_exists = $this->db->table_exists('facebook_pages');
 
-        foreach ($rows as $k => $p) {
-            $fallback = 'https://graph.facebook.com/' . $p['fb_page_id'] . '/picture?type=normal';
-            $chosen   = !empty($p['page_picture']) ? $p['page_picture'] : $fallback;
-            $sep = (strpos($chosen,'?')===false)?'?':'&';
-            $rows[$k]['_img'] = $chosen . $sep . 'v=' . substr(md5($p['fb_page_id'].time()),0,6);
-            // بجعل fb_page_id نص لتفادي المقارنات الصارمة
-            $rows[$k]['fb_page_id'] = (string)$rows[$k]['fb_page_id'];
+        if ($facebook_pages_exists) {
+            // Build SELECT dynamically to avoid errors if some columns missing
+            $select = [
+                "rx.id AS rx_id",
+                "rx.page_id AS fb_page_id",
+                "COALESCE(rx.page_name, rx.username, rx.page_id) AS page_name",
+                "COALESCE(rx.page_profile, rx.page_cover, '') AS page_picture",
+                "COALESCE(rx.page_access_token, '') AS page_access_token",
+                // defaults from facebook_pages; use COALESCE to fall back
+                "COALESCE(fp.is_favorite, 0) AS is_favorite"
+            ];
+
+            // optional IG and stats columns: add only if field exists to avoid SQL errors
+            if ($this->db->field_exists('ig_linked', 'facebook_pages'))         $select[] = "COALESCE(fp.ig_linked, 0) AS ig_linked";
+            if ($this->db->field_exists('ig_user_id', 'facebook_pages'))        $select[] = "COALESCE(fp.ig_user_id, '') AS ig_user_id";
+            if ($this->db->field_exists('ig_username', 'facebook_pages'))       $select[] = "COALESCE(fp.ig_username, '') AS ig_username";
+            if ($this->db->field_exists('ig_profile_picture', 'facebook_pages'))$select[] = "COALESCE(fp.ig_profile_picture, '') AS ig_profile_picture";
+            if ($this->db->field_exists('ig_health_status', 'facebook_pages'))  $select[] = "COALESCE(fp.ig_health_status, '') AS ig_health_status";
+            if ($this->db->field_exists('scheduled_count', 'facebook_pages'))   $select[] = "COALESCE(fp.scheduled_count, 0) AS scheduled_count";
+            if ($this->db->field_exists('last_posted_at', 'facebook_pages'))    $select[] = "COALESCE(fp.last_posted_at, '') AS last_posted_at";
+
+            $this->db->select(implode(',', $select), false);
+            $this->db->from('facebook_rx_fb_page_info rx');
+            // join on both page id and user_id to avoid cross-user mapping
+            $this->db->join('facebook_pages fp', 'fp.fb_page_id = rx.page_id AND fp.user_id = rx.user_id', 'left');
+            $this->db->where('rx.user_id', $user_id);
+            $this->db->order_by('COALESCE(rx.page_name, rx.username, rx.page_id)', 'ASC', false);
+            $rows = $this->db->get()->result_array();
+
+            // If some IG columns didn't exist in facebook_pages, maybe they exist in rx table; merge them
+            $rx_has_ig_linked = $this->db->field_exists('ig_linked', 'facebook_rx_fb_page_info');
+            $rx_has_ig_user_id = $this->db->field_exists('instagram_business_account_id', 'facebook_rx_fb_page_info') || $this->db->field_exists('ig_user_id', 'facebook_rx_fb_page_info');
+            $rx_has_ig_username = $this->db->field_exists('ig_username', 'facebook_rx_fb_page_info');
+            $rx_has_ig_profile_picture = $this->db->field_exists('ig_profile_picture', 'facebook_rx_fb_page_info');
+            $rx_has_ig_health = $this->db->field_exists('ig_health_status', 'facebook_rx_fb_page_info');
+
+            foreach ($rows as $k => $r) {
+                // if facebook_pages didn't provide IG fields, attempt to pull from rx row (some installations store IG there)
+                if ((!isset($r['ig_linked']) || $r['ig_linked'] === null) && $rx_has_ig_linked) {
+                    $rows[$k]['ig_linked'] = !empty($r['ig_linked']) ? 1 : 0;
+                }
+                if ((!isset($r['ig_user_id']) || $r['ig_user_id'] === '') && $rx_has_ig_user_id) {
+                    $value = $r['instagram_business_account_id'] ?? ($r['ig_user_id'] ?? '');
+                    $rows[$k]['ig_user_id'] = $value ?? '';
+                }
+                if ((!isset($r['ig_username']) || $r['ig_username'] === '') && $rx_has_ig_username) {
+                    $rows[$k]['ig_username'] = $r['ig_username'] ?? '';
+                }
+                if ((!isset($r['ig_profile_picture']) || $r['ig_profile_picture'] === '') && $rx_has_ig_profile_picture) {
+                    $rows[$k]['ig_profile_picture'] = $r['ig_profile_picture'] ?? '';
+                }
+                if ((!isset($r['ig_health_status']) || $r['ig_health_status'] === '') && $rx_has_ig_health) {
+                    $rows[$k]['ig_health_status'] = $r['ig_health_status'] ?? '';
+                }
+
+                // ensure defaults for any missing keys
+                $rows[$k]['is_favorite'] = isset($r['is_favorite']) ? (int)$r['is_favorite'] : 0;
+                $rows[$k]['ig_linked'] = isset($rows[$k]['ig_linked']) ? ((int)$rows[$k]['ig_linked']) : 0;
+                $rows[$k]['ig_user_id'] = isset($rows[$k]['ig_user_id']) ? (string)$rows[$k]['ig_user_id'] : '';
+                $rows[$k]['ig_username'] = isset($rows[$k]['ig_username']) ? (string)$rows[$k]['ig_username'] : '';
+                $rows[$k]['ig_profile_picture'] = isset($rows[$k]['ig_profile_picture']) ? (string)$rows[$k]['ig_profile_picture'] : '';
+                $rows[$k]['ig_health_status'] = isset($rows[$k]['ig_health_status']) ? (string)$rows[$k]['ig_health_status'] : '';
+                $rows[$k]['scheduled_count'] = isset($rows[$k]['scheduled_count']) ? (int)$rows[$k]['scheduled_count'] : 0;
+                $rows[$k]['last_posted_at'] = isset($rows[$k]['last_posted_at']) ? (string)$rows[$k]['last_posted_at'] : '';
+            }
+
+        } else {
+            // facebook_pages table missing: select base fields and try to read IG fields from rx table (if present)
+            $this->db->select("
+                rx.id AS rx_id,
+                rx.page_id AS fb_page_id,
+                COALESCE(rx.page_name, rx.username, rx.page_id) AS page_name,
+                COALESCE(rx.page_profile, rx.page_cover, '') AS page_picture,
+                COALESCE(rx.page_access_token, '') AS page_access_token
+            ", false);
+            $this->db->from('facebook_rx_fb_page_info rx');
+            $this->db->where('rx.user_id', $user_id);
+            $this->db->order_by('COALESCE(rx.page_name, rx.username, rx.page_id)', 'ASC', false);
+            $rows = $this->db->get()->result_array();
+
+            // Expand rows with defaults and check rx columns for IG if present
+            $rx_has_ig_linked = $this->db->field_exists('ig_linked', 'facebook_rx_fb_page_info');
+            $rx_has_ig_user_id = $this->db->field_exists('instagram_business_account_id', 'facebook_rx_fb_page_info') || $this->db->field_exists('ig_user_id', 'facebook_rx_fb_page_info');
+            $rx_has_ig_username = $this->db->field_exists('ig_username', 'facebook_rx_fb_page_info');
+            $rx_has_ig_profile_picture = $this->db->field_exists('ig_profile_picture', 'facebook_rx_fb_page_info');
+            $rx_has_ig_health = $this->db->field_exists('ig_health_status', 'facebook_rx_fb_page_info');
+
+            foreach ($rows as $k => $r) {
+                $rows[$k]['is_favorite'] = 0;
+                $rows[$k]['ig_linked'] = $rx_has_ig_linked ? (!empty($r['ig_linked']) ? 1 : 0) : 0;
+                $rows[$k]['ig_user_id'] = $rx_has_ig_user_id ? (string)($r['instagram_business_account_id'] ?? ($r['ig_user_id'] ?? '')) : '';
+                $rows[$k]['ig_username'] = $rx_has_ig_username ? (string)($r['ig_username'] ?? '') : '';
+                $rows[$k]['ig_profile_picture'] = $rx_has_ig_profile_picture ? (string)($r['ig_profile_picture'] ?? '') : '';
+                $rows[$k]['ig_health_status'] = $rx_has_ig_health ? (string)($r['ig_health_status'] ?? '') : '';
+                $rows[$k]['scheduled_count'] = 0;
+                $rows[$k]['last_posted_at'] = '';
+            }
         }
 
-        return $rows;
+        // Final normalization: ensure fb_page_id as string, add _img and ig_state convenience field
+        $final = [];
+        foreach ($rows as $r) {
+            $fbid = isset($r['fb_page_id']) ? (string)$r['fb_page_id'] : '';
+            $page_picture = isset($r['page_picture']) ? $r['page_picture'] : '';
+            $page_access_token = isset($r['page_access_token']) ? $r['page_access_token'] : '';
+
+            $img = $page_picture ? $page_picture : ('https://graph.facebook.com/'.$fbid.'/picture?type=normal');
+            $sep = (strpos($img,'?') === false) ? '?' : '&';
+            $img .= $sep . 'v=' . substr(md5($fbid),0,6);
+
+            $item = [
+                'rx_id' => $r['rx_id'] ?? null,
+                'fb_page_id' => $fbid,
+                'page_name' => $r['page_name'] ?? $fbid,
+                'page_picture' => $page_picture,
+                'page_access_token' => $page_access_token,
+                'is_favorite' => isset($r['is_favorite']) ? (int)$r['is_favorite'] : 0,
+                'ig_linked' => isset($r['ig_linked']) ? (int)$r['ig_linked'] : 0,
+                'ig_user_id' => isset($r['ig_user_id']) ? (string)$r['ig_user_id'] : '',
+                'ig_username' => isset($r['ig_username']) ? (string)$r['ig_username'] : '',
+                'ig_profile_picture' => isset($r['ig_profile_picture']) ? (string)$r['ig_profile_picture'] : '',
+                'ig_health_status' => isset($r['ig_health_status']) ? (string)$r['ig_health_status'] : '',
+                'scheduled_count' => isset($r['scheduled_count']) ? (int)$r['scheduled_count'] : 0,
+                'last_posted_at' => isset($r['last_posted_at']) ? (string)$r['last_posted_at'] : '',
+                '_img' => $img
+            ];
+
+            if ($item['ig_linked'] && $item['ig_user_id'] !== '') {
+                $item['ig_state'] = 'linked';
+            } elseif ($item['ig_linked']) {
+                $item['ig_state'] = 'detected';
+            } else {
+                $item['ig_state'] = 'none';
+            }
+
+            $final[] = $item;
+        }
+
+        return $final;
     }
 
     /* ================= ريلز المستخدم ================= */
@@ -511,7 +636,7 @@ private function resolvePageToken($page){
             ];
             if($this->columnExists('reels','media_type')) $insertData['media_type']='reel';
 
-            // إدراج مع التحقق من أخطاء القاعدة
+            // إدخال مع التحقق من أخطاء
             try {
                 $this->db->insert('reels',$insertData);
                 $dberr=$this->db->error();
@@ -647,6 +772,8 @@ private function resolvePageToken($page){
         }
         return $rows;
     }
+    
+    
 
 public function process_scheduled_reel($row)
 {
